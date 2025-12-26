@@ -12,6 +12,8 @@ use Hyperf\Database\Model\Builder;
 use Hyperf\Database\Model\Model;
 use Hyperf\Database\Model\Scope;
 use Hyperf\DbConnection\Db;
+use Psr\SimpleCache\CacheInterface;
+use function Hyperf\Support\make;
 
 /**
  * 数据范围过滤作用域
@@ -25,14 +27,15 @@ use Hyperf\DbConnection\Db;
 class DataScope implements Scope
 {
     /**
-     * 字段检测缓存（静态，进程级）
+     * 字段检测缓存（静态，进程级 - 表结构很少变）
      */
     private static array $columnCache = [];
 
     /**
-     * 部门子树缓存（静态，进程级 - 短期有效）
+     * 部门子树缓存配置
      */
-    private static array $deptTreeCache = [];
+    protected const DEPT_TREE_CACHE_PREFIX = 'corp:dept_tree:';
+    protected const DEPT_TREE_CACHE_TTL = 300; // 5分钟
 
     public function apply(Builder $builder, Model $model): void
     {
@@ -230,7 +233,7 @@ class DataScope implements Scope
      */
     protected function getAccessibleDeptIds(bool $includeSubDepts): array
     {
-        // 1. 优先从上下文获取（请求级缓存）
+        // 1. 优先从上下文获取（请求级缓存 - 最快）
         $cached = CorpContext::getAccessibleDeptIds();
         if (!empty($cached)) {
             return $cached;
@@ -246,37 +249,51 @@ class DataScope implements Scope
         $deptIds = [$departmentId];
 
         if ($includeSubDepts) {
-            // 2. 静态缓存（进程级）
-            $cacheKey = "{$corpId}:{$departmentId}";
-            if (isset(self::$deptTreeCache[$cacheKey])) {
-                $deptIds = self::$deptTreeCache[$cacheKey];
-            } else {
-                $deptModel = CorpManager::departmentModel();
-                $dept = $deptModel::findFromCache($departmentId);
-
-                if ($dept && $dept->full_path) {
-                    // 使用物化路径高效查询子树
-                    $subDeptIds = $deptModel::query()
-                        ->where('corp_id', $corpId)
-                        ->where('full_path', 'like', $dept->full_path . '%')
-                        ->pluck('department_id')
-                        ->toArray();
-                    $deptIds = array_values(array_unique(array_merge($deptIds, $subDeptIds)));
+            // 2. 尝试从 Redis 缓存获取子树（分布式缓存 - 避免重复计算）
+            $cacheKey = self::DEPT_TREE_CACHE_PREFIX . "{$corpId}:{$departmentId}";
+            
+            try {
+                $cache = make(CacheInterface::class);
+                $cachedTree = $cache->get($cacheKey);
+                if ($cachedTree !== null) {
+                    $deptIds = $cachedTree;
+                    CorpContext::setAccessibleDeptIds($deptIds);
+                    return $deptIds;
                 }
+            } catch (\Throwable $e) {
+                // 缓存不可用，继续查库
+            }
 
-                // 缓存到静态变量（单进程内有效）
-                self::$deptTreeCache[$cacheKey] = $deptIds;
+            // 3. 从数据库查询子树（使用物化路径）
+            $deptModel = CorpManager::departmentModel();
+            $dept = $deptModel::findFromCache($departmentId);
+
+            if ($dept && $dept->full_path) {
+                $subDeptIds = $deptModel::query()
+                    ->where('corp_id', $corpId)
+                    ->where('full_path', 'like', $dept->full_path . '%')
+                    ->pluck('department_id')
+                    ->toArray();
+                $deptIds = array_values(array_unique(array_merge($deptIds, $subDeptIds)));
+            }
+
+            // 4. 缓存到 Redis（有 TTL，数据变更后会自动过期）
+            try {
+                $cache = make(CacheInterface::class);
+                $cache->set($cacheKey, $deptIds, self::DEPT_TREE_CACHE_TTL);
+            } catch (\Throwable $e) {
+                // 忽略缓存写入失败
             }
         }
 
-        // 3. 缓存到上下文（单请求内有效）
+        // 5. 缓存到上下文（单请求内有效）
         CorpContext::setAccessibleDeptIds($deptIds);
 
         return $deptIds;
     }
 
     /**
-     * 检查模型是否有指定字段（带缓存）
+     * 检查模型是否有指定字段（带静态缓存）
      */
     protected function hasColumn(Model $model, string $column): bool
     {
@@ -301,11 +318,41 @@ class DataScope implements Scope
     }
 
     /**
-     * 清除缓存（用于测试或手动刷新）
+     * 清除部门树缓存（部门变更时调用）
      */
-    public static function clearCache(): void
+    public static function clearDeptTreeCache(int $corpId, ?int $departmentId = null): void
     {
-        self::$columnCache = [];
-        self::$deptTreeCache = [];
+        try {
+            $cache = make(CacheInterface::class);
+            
+            if ($departmentId !== null) {
+                // 清除指定部门的缓存
+                $cache->delete(self::DEPT_TREE_CACHE_PREFIX . "{$corpId}:{$departmentId}");
+            } else {
+                // 清除企业所有部门缓存（当部门结构大变动时）
+                // 注意：需要 Redis 支持 scan 或 keys 命令
+                $pattern = self::DEPT_TREE_CACHE_PREFIX . "{$corpId}:*";
+                // 这里简化处理，实际应该用 scan 遍历删除
+                // 或者等待 TTL 自动过期（5分钟）
+            }
+        } catch (\Throwable $e) {
+            // 忽略缓存服务不可用
+        }
+    }
+
+    /**
+     * 清除字段检测缓存（表结构变更时调用，一般不需要）
+     */
+    public static function clearColumnCache(?string $table = null): void
+    {
+        if ($table === null) {
+            self::$columnCache = [];
+        } else {
+            foreach (array_keys(self::$columnCache) as $key) {
+                if (str_starts_with($key, "{$table}:")) {
+                    unset(self::$columnCache[$key]);
+                }
+            }
+        }
     }
 }

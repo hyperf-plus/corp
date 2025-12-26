@@ -6,6 +6,7 @@ namespace HPlus\Corp\Service;
 
 use HPlus\Corp\CorpManager;
 use HPlus\Corp\Event\DepartmentEvent;
+use HPlus\Corp\Scope\DataScope;
 use Hyperf\Database\Model\Collection;
 
 /**
@@ -78,6 +79,11 @@ class DepartmentService
         $dept->full_path = $data['full_path'] . $dept->department_id . '/';
         $dept->save();
 
+        // 清理部门树缓存（父部门的子树缓存需要更新）
+        if ($parentId > 0) {
+            DataScope::clearDeptTreeCache($dept->corp_id, $parentId);
+        }
+
         // 派发事件
         DepartmentEvent::dispatch([
             'type' => DepartmentEvent::CREATED,
@@ -134,6 +140,11 @@ class DepartmentService
                 $child->level += $levelDiff;
                 $child->save();
             });
+
+        // 清理相关部门树缓存（旧父部门、新父部门、当前部门的缓存都需要清理）
+        DataScope::clearDeptTreeCache($dept->corp_id, $oldParentId);
+        DataScope::clearDeptTreeCache($dept->corp_id, $newParentId);
+        DataScope::clearDeptTreeCache($dept->corp_id, $departmentId);
 
         // 派发事件
         DepartmentEvent::dispatch([
@@ -201,6 +212,12 @@ class DepartmentService
         $result = (bool) $dept->delete();
 
         if ($result) {
+            // 清理部门树缓存（父部门的子树缓存需要更新）
+            if ($dept->parent_id > 0) {
+                DataScope::clearDeptTreeCache($dept->corp_id, $dept->parent_id);
+            }
+            DataScope::clearDeptTreeCache($dept->corp_id, $departmentId);
+
             // 派发事件
             DepartmentEvent::dispatch([
                 'type' => DepartmentEvent::DELETED,
