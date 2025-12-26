@@ -437,6 +437,187 @@ class Script extends Model
 }
 ```
 
+## 🛠️ 通用 CRUD 框架
+
+提供低代码的增删改查能力，集成权限控制和数据隔离。
+
+### Service 层
+
+```php
+use HPlus\Corp\Crud\CrudService;
+
+class OrderService extends CrudService
+{
+    // 模型类（必须）
+    protected string $model = Order::class;
+    
+    // 可搜索字段（模糊匹配）
+    protected array $searchable = ['order_no', 'customer_name'];
+    
+    // 可过滤字段（精确匹配）
+    protected array $filterable = ['status', 'type', 'department_id'];
+    
+    // 可排序字段
+    protected array $sortable = ['created_at', 'amount', 'id'];
+    
+    // 默认排序
+    protected array $defaultSort = ['created_at' => 'desc'];
+    
+    // 默认关联
+    protected array $with = ['customer', 'items'];
+    
+    // 创建前处理（可重写）
+    protected function beforeCreate(array $data): array
+    {
+        $data['order_no'] = $this->generateOrderNo();
+        return $data;
+    }
+    
+    // 删除前检查（可重写）
+    protected function beforeDelete(Model $model): bool
+    {
+        return $model->status !== Order::STATUS_PAID;
+    }
+}
+```
+
+**Service 提供的方法：**
+
+```php
+$service = make(OrderService::class);
+
+// 列表（分页、搜索、过滤、排序）
+$result = $service->list([
+    'keyword' => '关键词',
+    'status' => 1,
+    'start_time' => '2024-01-01',
+    'sort_field' => 'amount',
+    'sort_order' => 'desc',
+    'page' => 1,
+    'per_page' => 20,
+]);
+
+// 全部（不分页）
+$items = $service->all(['status' => 1]);
+
+// 详情
+$detail = $service->detail($id);
+
+// 创建
+$model = $service->create(['name' => '订单1']);
+
+// 更新
+$model = $service->update($id, ['status' => 2]);
+
+// 删除
+$service->delete($id);
+
+// 批量删除
+$service->batchDelete([1, 2, 3]);
+
+// 更新状态
+$service->updateStatus($id, 1);
+$service->batchUpdateStatus([1, 2, 3], 0);
+```
+
+### Controller 层
+
+**方式 1：继承 CrudController**
+
+```php
+use HPlus\Corp\Crud\CrudController;
+
+class OrderController extends CrudController
+{
+    protected string $service = OrderService::class;
+    
+    // 权限前缀（自动生成 order.list, order.create 等）
+    protected string $permissionPrefix = 'order';
+    
+    // 自定义验证
+    protected function validateCreate(array $data): ?string
+    {
+        if (empty($data['customer_id'])) {
+            return '请选择客户';
+        }
+        return null;
+    }
+}
+```
+
+**方式 2：使用 HasCrud Trait**
+
+```php
+use HPlus\Corp\Crud\Traits\HasCrud;
+
+class OrderController extends AbstractController
+{
+    use HasCrud;
+    
+    protected string $crudService = OrderService::class;
+    protected string $permissionPrefix = 'order';
+    
+    // 可以添加自定义方法
+    public function export(): array
+    {
+        // 自定义导出逻辑
+    }
+}
+```
+
+### 查询过滤器
+
+独立使用 QueryFilter 进行灵活查询：
+
+```php
+use HPlus\Corp\Crud\QueryFilter;
+
+// 基础用法
+$filter = QueryFilter::make($request->all())
+    ->searchable(['name', 'mobile', 'customer.name'])  // 支持关联搜索
+    ->filterable(['status', 'type', 'department_id'])
+    ->sortable(['created_at', 'amount'])
+    ->with(['customer', 'department'])
+    ->defaultSort(['created_at' => 'desc']);
+
+// 分页查询
+$result = $filter->paginate(Order::query());
+
+// 全部查询
+$items = $filter->get(Order::query());
+
+// 高级过滤配置
+$filter->filterable([
+    'status',                           // 简单字段
+    'amount' => ['operator' => '>='],   // 自定义操作符
+    'tags' => ['operator' => 'json'],   // JSON 字段
+    'name' => ['operator' => 'like'],   // 模糊匹配
+]);
+```
+
+### 路由配置
+
+```php
+// 标准 RESTful 路由
+Router::addGroup('/api/orders', function () {
+    Router::get('', [OrderController::class, 'list']);
+    Router::get('/all', [OrderController::class, 'all']);
+    Router::get('/{id}', [OrderController::class, 'detail']);
+    Router::post('', [OrderController::class, 'create']);
+    Router::put('/{id}', [OrderController::class, 'update']);
+    Router::delete('/{id}', [OrderController::class, 'delete']);
+    Router::post('/batch-delete', [OrderController::class, 'batchDelete']);
+    Router::post('/{id}/status', [OrderController::class, 'updateStatus']);
+});
+```
+
+### CRUD 权限自动集成
+
+- 配置 `permissionPrefix = 'order'` 后
+- 自动检查权限：`order.list`, `order.detail`, `order.create`, `order.update`, `order.delete`
+- 管理员（`CorpContext::isAdmin() = true`）自动跳过
+- 权限不足抛出 `PermissionDeniedException`
+
 ## 📝 事件系统
 
 组织架构变更自动触发事件，支持监听扩展：
