@@ -70,6 +70,14 @@ class CorpManager
     }
 
     /**
+     * 获取协作者模型类
+     */
+    public static function collaboratorModel(): string
+    {
+        return config('corp.models.collaborator', \HPlus\Corp\Model\Collaborator::class);
+    }
+
+    /**
      * 创建模型实例
      */
     public static function make(string $type): object
@@ -82,10 +90,10 @@ class CorpManager
             'role_user' => self::roleUserModel(),
             'permission' => self::permissionModel(),
             'role_permission' => self::rolePermissionModel(),
+            'collaborator' => self::collaboratorModel(),
             default => throw new \InvalidArgumentException("Unknown model type: {$type}"),
         };
 
         return new $class();
     }
 }
-

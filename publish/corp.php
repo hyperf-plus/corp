@@ -12,6 +12,7 @@ return [
         'role_user' => \HPlus\Corp\Model\RoleUser::class,
         'permission' => \HPlus\Corp\Model\Permission::class,
         'role_permission' => \HPlus\Corp\Model\RolePermission::class,
+        'collaborator' => \HPlus\Corp\Model\Collaborator::class,
     ],
 
     // 表名配置（支持自定义表前缀）
@@ -23,6 +24,14 @@ return [
         'role_users' => 'role_users',
         'permissions' => 'permissions',
         'role_permissions' => 'role_permissions',
+        'collaborators' => 'collaborators',
+    ],
+
+    // 协作者配置
+    'collaborator' => [
+        // 协作者表名
+        'table' => 'collaborators',
+        // 缓存时间（秒）
+        'cache_ttl' => 300,
     ],
 ];
-
