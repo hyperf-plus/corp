@@ -439,7 +439,7 @@ class Script extends Model
 
 ## 🛠️ 通用 CRUD 框架
 
-提供低代码的增删改查能力，集成权限控制和数据隔离。
+配合 [hyperf-plus/route](https://github.com/hyperf-plus/route) + [hyperf-plus/validate](https://github.com/hyperf-plus/validate) 使用，提供低代码的增删改查能力。
 
 ### Service 层
 
@@ -448,175 +448,123 @@ use HPlus\Corp\Crud\CrudService;
 
 class OrderService extends CrudService
 {
-    // 模型类（必须）
     protected string $model = Order::class;
     
-    // 可搜索字段（模糊匹配）
-    protected array $searchable = ['order_no', 'customer_name'];
+    // 可搜索字段（模糊匹配，支持关联如 customer.name）
+    protected array $searchable = ['order_no', 'customer.name'];
     
     // 可过滤字段（精确匹配）
     protected array $filterable = ['status', 'type', 'department_id'];
     
-    // 可排序字段
-    protected array $sortable = ['created_at', 'amount', 'id'];
-    
-    // 默认排序
+    // 可排序 / 默认排序 / 默认关联
+    protected array $sortable = ['created_at', 'amount'];
     protected array $defaultSort = ['created_at' => 'desc'];
+    protected array $with = ['customer'];
     
-    // 默认关联
-    protected array $with = ['customer', 'items'];
-    
-    // 创建前处理（可重写）
+    // 钩子方法
     protected function beforeCreate(array $data): array
     {
         $data['order_no'] = $this->generateOrderNo();
         return $data;
     }
     
-    // 删除前检查（可重写）
     protected function beforeDelete(Model $model): bool
     {
         return $model->status !== Order::STATUS_PAID;
     }
+    
+    // 数据转换
+    protected function transform(Model $model): array
+    {
+        return [...$model->toArray(), 'status_text' => Order::STATUS_MAP[$model->status] ?? ''];
+    }
 }
 ```
 
-**Service 提供的方法：**
+### Controller 层（配合注解体系）
+
+```php
+use HPlus\Route\Annotation\ApiController;
+use HPlus\Route\Annotation\GetApi;
+use HPlus\Route\Annotation\PostApi;
+use HPlus\Validate\Annotations\RequestValidation;
+use HPlus\Corp\Annotation\Permission;
+use HPlus\Corp\Crud\Traits\HasCrud;
+
+#[ApiController(prefix: '/api/orders')]
+class OrderController
+{
+    use HasCrud;
+    
+    protected string $service = OrderService::class;
+    
+    #[GetApi]
+    #[Permission('order.list')]
+    public function list() { return $this->handleList(); }
+    
+    #[GetApi(path: '/{id:\d+}')]
+    #[Permission('order.detail')]
+    public function detail(int $id) { return $this->handleDetail($id); }
+    
+    #[PostApi]
+    #[Permission('order.create')]
+    #[RequestValidation(rules: [
+        'customer_id' => 'required|integer|exists:customers,id',
+        'items' => 'required|array|min:1',
+        'items.*.product_id' => 'required|integer',
+    ], messages: ['customer_id.required' => '请选择客户'])]
+    public function create() { return $this->handleCreate(); }
+    
+    #[PostApi(path: '/{id:\d+}')]
+    #[Permission('order.update')]
+    #[RequestValidation(rules: ['status' => 'required|integer|in:1,2,3'])]
+    public function update(int $id) { return $this->handleUpdate($id); }
+    
+    #[PostApi(path: '/{id:\d+}/delete')]
+    #[Permission('order.delete')]
+    public function delete(int $id) { return $this->handleDelete($id); }
+    
+    #[PostApi(path: '/batch-delete')]
+    #[Permission('order.delete')]
+    #[RequestValidation(rules: ['ids' => 'required|array|min:1'])]
+    public function batchDelete() { return $this->handleBatchDelete(); }
+}
+```
+
+### HasCrud Trait 方法
+
+| 方法 | 说明 |
+|------|------|
+| `handleList()` | 列表（分页、搜索、过滤、排序） |
+| `handleAll()` | 全部（不分页） |
+| `handleDetail($id)` | 详情 |
+| `handleCreate()` | 创建 |
+| `handleUpdate($id)` | 更新 |
+| `handleDelete($id)` | 删除 |
+| `handleBatchDelete()` | 批量删除 |
+| `handleUpdateStatus($id)` | 更新状态 |
+| `handleBatchUpdateStatus()` | 批量更新状态 |
+
+### Service 方法
 
 ```php
 $service = make(OrderService::class);
 
-// 列表（分页、搜索、过滤、排序）
-$result = $service->list([
-    'keyword' => '关键词',
-    'status' => 1,
-    'start_time' => '2024-01-01',
-    'sort_field' => 'amount',
-    'sort_order' => 'desc',
-    'page' => 1,
-    'per_page' => 20,
-]);
-
-// 全部（不分页）
+// 查询
+$result = $service->list(['keyword' => '关键词', 'status' => 1, 'page' => 1]);
 $items = $service->all(['status' => 1]);
-
-// 详情
 $detail = $service->detail($id);
+$model = $service->find($id);
+$model = $service->findBy(['order_no' => 'ORD001']);
 
-// 创建
-$model = $service->create(['name' => '订单1']);
-
-// 更新
+// 写入
+$model = $service->create(['customer_id' => 1]);
 $model = $service->update($id, ['status' => 2]);
-
-// 删除
 $service->delete($id);
-
-// 批量删除
 $service->batchDelete([1, 2, 3]);
-
-// 更新状态
 $service->updateStatus($id, 1);
 $service->batchUpdateStatus([1, 2, 3], 0);
 ```
-
-### Controller 层
-
-**方式 1：继承 CrudController**
-
-```php
-use HPlus\Corp\Crud\CrudController;
-
-class OrderController extends CrudController
-{
-    protected string $service = OrderService::class;
-    
-    // 权限前缀（自动生成 order.list, order.create 等）
-    protected string $permissionPrefix = 'order';
-    
-    // 自定义验证
-    protected function validateCreate(array $data): ?string
-    {
-        if (empty($data['customer_id'])) {
-            return '请选择客户';
-        }
-        return null;
-    }
-}
-```
-
-**方式 2：使用 HasCrud Trait**
-
-```php
-use HPlus\Corp\Crud\Traits\HasCrud;
-
-class OrderController extends AbstractController
-{
-    use HasCrud;
-    
-    protected string $crudService = OrderService::class;
-    protected string $permissionPrefix = 'order';
-    
-    // 可以添加自定义方法
-    public function export(): array
-    {
-        // 自定义导出逻辑
-    }
-}
-```
-
-### 查询过滤器
-
-独立使用 QueryFilter 进行灵活查询：
-
-```php
-use HPlus\Corp\Crud\QueryFilter;
-
-// 基础用法
-$filter = QueryFilter::make($request->all())
-    ->searchable(['name', 'mobile', 'customer.name'])  // 支持关联搜索
-    ->filterable(['status', 'type', 'department_id'])
-    ->sortable(['created_at', 'amount'])
-    ->with(['customer', 'department'])
-    ->defaultSort(['created_at' => 'desc']);
-
-// 分页查询
-$result = $filter->paginate(Order::query());
-
-// 全部查询
-$items = $filter->get(Order::query());
-
-// 高级过滤配置
-$filter->filterable([
-    'status',                           // 简单字段
-    'amount' => ['operator' => '>='],   // 自定义操作符
-    'tags' => ['operator' => 'json'],   // JSON 字段
-    'name' => ['operator' => 'like'],   // 模糊匹配
-]);
-```
-
-### 路由配置
-
-```php
-// 标准 RESTful 路由
-Router::addGroup('/api/orders', function () {
-    Router::get('', [OrderController::class, 'list']);
-    Router::get('/all', [OrderController::class, 'all']);
-    Router::get('/{id}', [OrderController::class, 'detail']);
-    Router::post('', [OrderController::class, 'create']);
-    Router::put('/{id}', [OrderController::class, 'update']);
-    Router::delete('/{id}', [OrderController::class, 'delete']);
-    Router::post('/batch-delete', [OrderController::class, 'batchDelete']);
-    Router::post('/{id}/status', [OrderController::class, 'updateStatus']);
-});
-```
-
-### CRUD 权限自动集成
-
-- 配置 `permissionPrefix = 'order'` 后
-- 自动检查权限：`order.list`, `order.detail`, `order.create`, `order.update`, `order.delete`
-- 管理员（`CorpContext::isAdmin() = true`）自动跳过
-- 权限不足抛出 `PermissionDeniedException`
 
 ## 📝 事件系统
 
