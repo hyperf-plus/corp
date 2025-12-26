@@ -1,13 +1,21 @@
 {
     "name": "hyperf-plus/corp",
-    "description": "Hyperf 组织架构包 - 提供企业、部门、员工、角色等基础组织架构管理功能",
+    "description": "Hyperf 组织架构基础包 - 提供企业、部门、员工、角色、权限、数据隔离等完整功能。支持企业级和用户级两种数据隔离方式，内置协作者权限管理，开箱即用。",
     "keywords": [
         "hyperf",
-        "corp",
+        "php",
         "organization",
+        "rbac",
+        "permission",
+        "data-isolation",
+        "collaborator",
+        "enterprise",
         "department",
         "employee",
-        "role"
+        "role",
+        "access-control",
+        "multi-tenant",
+        "corp"
     ],
     "license": "MIT",
     "type": "library",
@@ -30,9 +38,6 @@
     "require-dev": {
         "phpunit/phpunit": "^10.0",
         "mockery/mockery": "^1.5"
-    },
-    "suggest": {
-        "hyperf-plus/scope": "数据作用域隔离包"
     },
     "autoload": {
         "psr-4": {
