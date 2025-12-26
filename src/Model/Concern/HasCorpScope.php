@@ -8,17 +8,23 @@ use HPlus\Corp\Context\CorpContext;
 use Hyperf\Database\Model\Builder;
 
 /**
- * 企业范围 Trait（仅过滤 corp_id，不过滤数据权限）
+ * 企业范围 Trait（企业级数据隔离）
  * 
- * 适用于只需要按企业隔离，不需要按角色数据权限过滤的场景
+ * 仅按 corp_id 过滤，适用于企业内所有人都可见的数据：
+ * - 通知、公告
+ * - 企业配置
+ * - 操作日志
+ * - 等等...
  * 
  * 使用方式：
  * ```php
- * class YourModel extends Model
+ * class Notification extends Model
  * {
  *     use HasCorpScope;
  * }
  * ```
+ * 
+ * 注意：如果需要按用户数据范围过滤，请使用 HasDataScope
  */
 trait HasCorpScope
 {
@@ -27,12 +33,17 @@ trait HasCorpScope
      */
     protected static function bootHasCorpScope(): void
     {
-        // 添加企业范围过滤
+        // 查询时自动过滤 corp_id
         static::addGlobalScope('corp_scope', function (Builder $builder) {
+            // 跳过过滤
+            if (CorpContext::isSkipDataScope()) {
+                return;
+            }
+
             $corpId = CorpContext::getCorpId();
             if ($corpId > 0) {
-                $model = $builder->getModel();
-                $builder->where($model->getTable() . '.corp_id', $corpId);
+                $table = $builder->getModel()->getTable();
+                $builder->where("{$table}.corp_id", $corpId);
             }
         });
 
@@ -61,4 +72,3 @@ trait HasCorpScope
             ->where((new static())->getTable() . '.corp_id', $corpId);
     }
 }
-

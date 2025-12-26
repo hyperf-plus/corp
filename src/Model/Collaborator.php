@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace HPlus\Corp\Model;
 
-use HPlus\Corp\Context\CorpContext;
 use Hyperf\Database\Model\Events\Created;
 use Hyperf\Database\Model\Events\Deleted;
 use Hyperf\Database\Model\Events\Updated;
@@ -17,24 +16,16 @@ use function Hyperf\Support\make;
 /**
  * 协作者模型
  * 
- * 支持任意资源类型的协作者权限管理
- * 
- * 资源类型可自定义，建议在业务代码中定义常量类：
- * ```php
- * class ResourceType {
- *     public const CORP = 1;
- *     public const SCRIPT = 10;   // 话术
- *     public const LINE = 11;     // 线路
- *     public const TASK = 12;     // 任务
- * }
- * ```
+ * 支持任意资源类型的协作者权限管理，内置多级缓存：
+ * - Redis 缓存：用户资源 ID 列表（5分钟）
+ * - 静态缓存：单进程内避免重复查询
  */
 class Collaborator extends Model
 {
     use SoftDeletes;
 
     /**
-     * 资源类型常量（业务方可自定义）
+     * 资源类型常量（业务方可自定义任意整数）
      */
     public const RESOURCE_TYPE_CORP = 1;
     public const RESOURCE_TYPE_AGENT = 2;
@@ -56,10 +47,15 @@ class Collaborator extends Model
     public const STATUS_ENABLED = 1;
 
     /**
-     * 缓存前缀
+     * 缓存配置
      */
-    protected const CACHE_PREFIX = 'corp:collaborator:';
+    protected const CACHE_PREFIX = 'corp:collab:';
     protected const CACHE_TTL = 300;
+
+    /**
+     * 静态缓存（进程级，避免单次请求重复查询）
+     */
+    private static array $localCache = [];
 
     protected array $fillable = [
         'user_id',
@@ -83,68 +79,89 @@ class Collaborator extends Model
         return $this->table ?? config('corp.collaborator.table', 'collaborators');
     }
 
-    /**
-     * 模型事件：创建后清理缓存
-     */
+    // ==================== 模型事件（自动清理缓存） ====================
+
     public function created(Created $event): void
     {
-        $this->clearCache();
+        $this->clearRelatedCache();
     }
 
-    /**
-     * 模型事件：更新后清理缓存
-     */
     public function updated(Updated $event): void
     {
-        $this->clearCache();
+        $this->clearRelatedCache();
     }
 
-    /**
-     * 模型事件：删除后清理缓存
-     */
     public function deleted(Deleted $event): void
     {
-        $this->clearCache();
+        $this->clearRelatedCache();
     }
 
-    /**
-     * 清理当前记录相关缓存
-     */
-    protected function clearCache(): void
+    protected function clearRelatedCache(): void
     {
         self::clearUserResourceCache($this->user_id, $this->resource_type);
     }
+
+    // ==================== 缓存管理 ====================
 
     /**
      * 清理用户资源缓存
      */
     public static function clearUserResourceCache(int $userId, int $resourceType): void
     {
+        // 清理静态缓存
+        $localKey = "{$userId}:{$resourceType}";
+        unset(self::$localCache[$localKey]);
+
+        // 清理 Redis 缓存
         try {
             $cache = make(CacheInterface::class);
-            $cache->delete(self::CACHE_PREFIX . "{$userId}:{$resourceType}");
+            $cache->delete(self::CACHE_PREFIX . $localKey);
         } catch (\Throwable $e) {
-            // 缓存服务不可用时忽略
+            // 忽略缓存服务不可用
         }
     }
 
     /**
-     * 获取用户可访问的资源ID列表（带缓存）
+     * 清理所有静态缓存（用于长驻进程）
+     */
+    public static function clearLocalCache(): void
+    {
+        self::$localCache = [];
+    }
+
+    // ==================== 核心查询方法 ====================
+
+    /**
+     * 获取用户可访问的资源ID列表（多级缓存）
+     * 
+     * 缓存层级：
+     * 1. 静态缓存（进程内）
+     * 2. Redis 缓存（5分钟）
+     * 3. 数据库查询
      */
     public static function getUserResourceIds(int $userId, int $resourceType): array
     {
-        $cacheKey = self::CACHE_PREFIX . "{$userId}:{$resourceType}";
+        $localKey = "{$userId}:{$resourceType}";
 
+        // 1. 静态缓存
+        if (isset(self::$localCache[$localKey])) {
+            return self::$localCache[$localKey];
+        }
+
+        // 2. Redis 缓存
+        $cacheKey = self::CACHE_PREFIX . $localKey;
         try {
             $cache = make(CacheInterface::class);
             $cached = $cache->get($cacheKey);
             if ($cached !== null) {
+                self::$localCache[$localKey] = $cached;
                 return $cached;
             }
         } catch (\Throwable $e) {
-            // 缓存不可用，直接查库
+            // 缓存不可用，继续查库
         }
 
+        // 3. 数据库查询
         $resourceIds = static::query()
             ->where('user_id', $userId)
             ->where('resource_type', $resourceType)
@@ -152,15 +169,44 @@ class Collaborator extends Model
             ->pluck('resource_id')
             ->toArray();
 
+        // 写入缓存
+        self::$localCache[$localKey] = $resourceIds;
         try {
             $cache = make(CacheInterface::class);
-            $cache->set($cacheKey, $resourceIds, self::CACHE_TTL);
+            $cache->set($cacheKey, $resourceIds, config('corp.collaborator.cache_ttl', self::CACHE_TTL));
         } catch (\Throwable $e) {
-            // 忽略缓存写入失败
+            // 忽略
         }
 
         return $resourceIds;
     }
+
+    /**
+     * 检查用户是否有权限（优先走缓存）
+     */
+    public static function hasPermission(int $userId, int $resourceId, int $resourceType, int $scope = self::SCOPE_VIEW): bool
+    {
+        // 先检查缓存的资源列表
+        $resourceIds = self::getUserResourceIds($userId, $resourceType);
+        if (!in_array($resourceId, $resourceIds)) {
+            return false;
+        }
+
+        // 再检查权限级别（需要查库，但只有在资源ID命中时才查）
+        if ($scope > self::SCOPE_VIEW) {
+            return static::query()
+                ->where('user_id', $userId)
+                ->where('resource_id', $resourceId)
+                ->where('resource_type', $resourceType)
+                ->where('scopes', '>=', $scope)
+                ->where('status', self::STATUS_ENABLED)
+                ->exists();
+        }
+
+        return true;
+    }
+
+    // ==================== 协作者管理方法 ====================
 
     /**
      * 添加协作者
@@ -199,21 +245,7 @@ class Collaborator extends Model
     }
 
     /**
-     * 检查用户是否有权限
-     */
-    public static function hasPermission(int $userId, int $resourceId, int $resourceType, int $scope = self::SCOPE_VIEW): bool
-    {
-        return static::query()
-            ->where('user_id', $userId)
-            ->where('resource_id', $resourceId)
-            ->where('resource_type', $resourceType)
-            ->where('scopes', '>=', $scope)
-            ->where('status', self::STATUS_ENABLED)
-            ->exists();
-    }
-
-    /**
-     * 获取资源的所有协作者ID
+     * 获取资源的所有协作者用户ID
      */
     public static function getResourceUserIds(int $resourceId, int $resourceType): array
     {
@@ -239,33 +271,13 @@ class Collaborator extends Model
     }
 
     /**
-     * 清除资源的所有协作者
-     */
-    public static function clearResourceCollaborators(int $resourceId, int $resourceType): int
-    {
-        $userIds = static::getResourceUserIds($resourceId, $resourceType);
-
-        $deleted = static::query()
-            ->where('resource_id', $resourceId)
-            ->where('resource_type', $resourceType)
-            ->delete();
-
-        foreach ($userIds as $userId) {
-            self::clearUserResourceCache($userId, $resourceType);
-        }
-
-        return $deleted;
-    }
-
-    /**
      * 设置资源的协作者（替换现有）
      */
     public static function setResourceCollaborators(int $resourceId, int $resourceType, array $userIds, int $scopes = self::SCOPE_VIEW): void
     {
-        // 获取原有用户，用于清理缓存
         $oldUserIds = static::getResourceUserIds($resourceId, $resourceType);
 
-        // 删除原有记录
+        // 删除旧记录
         static::query()
             ->where('resource_id', $resourceId)
             ->where('resource_type', $resourceType)
@@ -288,5 +300,23 @@ class Collaborator extends Model
             self::clearUserResourceCache($userId, $resourceType);
         }
     }
-}
 
+    /**
+     * 清除资源的所有协作者
+     */
+    public static function clearResourceCollaborators(int $resourceId, int $resourceType): int
+    {
+        $userIds = static::getResourceUserIds($resourceId, $resourceType);
+
+        $deleted = static::query()
+            ->where('resource_id', $resourceId)
+            ->where('resource_type', $resourceType)
+            ->delete();
+
+        foreach ($userIds as $userId) {
+            self::clearUserResourceCache($userId, $resourceType);
+        }
+
+        return $deleted;
+    }
+}

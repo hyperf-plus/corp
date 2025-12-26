@@ -4,17 +4,17 @@
 [![Hyperf Version](https://img.shields.io/badge/hyperf-%7E3.1.0-green)](https://hyperf.io)
 [![License](https://img.shields.io/badge/license-MIT-brightgreen)](LICENSE)
 
-Hyperf 组织架构基础包，提供企业、部门、员工、角色、数据隔离、协作者等完整功能。
+Hyperf 组织架构基础包，提供企业、部门、员工、角色、数据隔离等完整功能。
 
 ## 特性
 
 - 📦 **开箱即用** - 完整的组织架构数据模型
-- 🚀 **高性能** - 内置 Hyperf 模型缓存
-- 🌳 **树形结构** - 部门支持物化路径，高效子树查询
-- 🔒 **数据隔离** - 自动按企业/部门/员工过滤数据
-- 🔐 **权限系统** - 完整的 RBAC 权限管理
+- 🚀 **高性能** - 多级缓存（静态 + Redis）
+- 🌳 **树形结构** - 部门物化路径，高效子树查询
+- 🔒 **数据隔离** - 企业级 / 用户级两种隔离方式
 - 👥 **协作者** - 支持任意资源类型的协作权限
-- 🔧 **易扩展** - 精简核心字段，业务扩展自由
+- 🔐 **权限系统** - 完整的 RBAC + 注解权限
+- 🔧 **易扩展** - 模型可重写，配置灵活
 
 ## 安装
 
@@ -24,82 +24,46 @@ composer require hyperf-plus/corp
 
 ## 快速开始
 
-### 1. 发布配置和迁移
-
 ```bash
+# 发布配置和迁移
 php bin/hyperf.php vendor:publish hyperf-plus/corp
-```
 
-### 2. 运行迁移
-
-```bash
+# 运行迁移
 php bin/hyperf.php migrate
-```
-
-### 3. 使用模型
-
-```php
-use HPlus\Corp\Model\Corp;
-use HPlus\Corp\Model\Department;
-use HPlus\Corp\Model\Employee;
-use HPlus\Corp\Model\Role;
-
-// 创建企业
-$corp = Corp::create([
-    'name' => '测试企业',
-    'corp_code' => 'test001',
-]);
-
-// 创建部门
-$dept = Department::create([
-    'corp_id' => $corp->corp_id,
-    'name' => '技术部',
-    'parent_id' => 0,
-]);
-
-// 创建员工
-$employee = Employee::create([
-    'corp_id' => $corp->corp_id,
-    'department_id' => $dept->department_id,
-    'name' => '张三',
-    'mobile' => '13800138000',
-]);
-
-// 创建角色
-$role = Role::create([
-    'corp_id' => $corp->corp_id,
-    'role_name' => '管理员',
-    'auth_range' => Role::AUTH_RANGE_ALL,
-]);
 ```
 
 ## 数据隔离
 
-### 1. 企业隔离（HasCorpScope）
+### 两种隔离方式
 
-仅按 `corp_id` 隔离，适合企业级配置等场景：
+| Trait | 隔离维度 | 适用场景 |
+|-------|---------|---------|
+| `HasCorpScope` | 企业级 | 通知、配置、日志（企业内所有人可见） |
+| `HasDataScope` | 用户级 | 业务数据（不同用户看到不同数据） |
+
+### 1. 企业级隔离（HasCorpScope）
 
 ```php
 use HPlus\Corp\Model\Concern\HasCorpScope;
 
-class Config extends Model
+class Notification extends Model
 {
     use HasCorpScope;
 }
 
 // 查询自动过滤当前企业
-$configs = Config::query()->get();
+$notifications = Notification::query()->get();
 
 // 跳过过滤
-Config::withoutCorpScope()->get();
+Notification::withoutCorpScope()->get();
 
-// 指定企业查询
-Config::ofCorp($corpId)->get();
+// 指定企业
+Notification::ofCorp($corpId)->get();
 ```
 
-### 2. 数据范围（HasDataScope）
+### 2. 用户级隔离（HasDataScope）
 
-基于角色的 `auth_range` 自动过滤数据：
+基于角色数据范围自动过滤：
 
 ```php
 use HPlus\Corp\Model\Concern\HasDataScope;
@@ -111,87 +75,82 @@ class Order extends Model
     protected array $fillable = ['corp_id', 'employee_id', 'department_id', ...];
 }
 
-// 查询自动根据 auth_range 过滤：
+// 自动根据角色 auth_range 过滤：
 // - 1: 仅本人 → WHERE employee_id = 当前员工
 // - 2: 本部门 → WHERE department_id = 当前部门
 // - 3: 本部门及下属 → WHERE department_id IN (部门及子部门)
 // - 4: 全部 → 不额外过滤
 
-$orders = Order::query()->get();
-
-// 创建时自动注入 corp_id、employee_id、department_id
-Order::create(['amount' => 100]);
+$orders = Order::query()->get();  // 自动过滤
+Order::create(['amount' => 100]); // 自动注入 corp_id、employee_id、department_id
 ```
 
-### 3. 协作者隔离（HasCollaboratorScope）
+### 3. 启用协作者（HasDataScope 扩展功能）
 
-基于协作者权限隔离，支持任意资源类型：
+支持协作者的资源，用户可见数据 = **角色数据范围 ∪ 被授权协作的数据**：
 
 ```php
-use HPlus\Corp\Model\Concern\HasCollaboratorScope;
+use HPlus\Corp\Model\Concern\HasDataScope;
 use HPlus\Corp\Model\Collaborator;
 
 class Script extends Model
 {
-    use HasCollaboratorScope;
+    use HasDataScope;
     
-    // 资源类型（必须定义）
-    protected int $resourceType = Collaborator::RESOURCE_TYPE_SCRIPT;
+    // 启用协作者
+    protected bool $enableCollaborator = true;
     
-    // 资源ID字段（默认为主键）
+    // 资源类型（自定义整数）
+    protected int $resourceType = 10;
+    
+    // 资源ID字段（默认主键）
     protected string $resourceIdColumn = 'id';
     
-    // 管理员是否可查看全部（默认 true）
-    protected bool $adminViewAll = true;
+    // 创建时自动将创建者添加为协作者（默认 true）
+    protected bool $autoAddCreatorAsCollaborator = true;
 }
 
-// 查询自动过滤有权限的数据
+// 查询：返回"角色权限内的" + "被授权协作的"
 $scripts = Script::query()->get();
 
-// 跳过过滤
-Script::withoutCollaboratorScope()->get();
+// 协作者管理
+$script->addCollaborator(userId: 1, scope: Collaborator::SCOPE_EDIT);
+$script->removeCollaborator(userId: 1);
+$script->setCollaborators([1, 2, 3]);
+$script->getCollaboratorIds();
+
+// 检查权限
+$script->hasCollaboratorPermission(userId: 1);
+$script->currentUserHasCollaboratorPermission();
 ```
 
-**协作者管理：**
+**资源类型常量（可自定义任意整数）：**
+
+```php
+Collaborator::RESOURCE_TYPE_SCRIPT = 10;  // 话术
+Collaborator::RESOURCE_TYPE_LINE = 11;    // 线路
+Collaborator::RESOURCE_TYPE_TASK = 12;    // 任务
+```
+
+**直接使用 Collaborator 模型：**
 
 ```php
 use HPlus\Corp\Model\Collaborator;
 
-// 添加协作者
-Collaborator::addCollaborator(
-    userId: 1, 
-    resourceId: 100, 
-    resourceType: Collaborator::RESOURCE_TYPE_SCRIPT,
-    scopes: Collaborator::SCOPE_EDIT
-);
+// 添加
+Collaborator::addCollaborator($userId, $resourceId, $resourceType);
 
-// 移除协作者
-Collaborator::removeCollaborator(userId: 1, resourceId: 100, resourceType: 10);
+// 移除
+Collaborator::removeCollaborator($userId, $resourceId, $resourceType);
 
-// 检查权限
-Collaborator::hasPermission(userId: 1, resourceId: 100, resourceType: 10);
+// 检查
+Collaborator::hasPermission($userId, $resourceId, $resourceType);
 
-// 获取用户可访问的资源
-$ids = Collaborator::getUserResourceIds(userId: 1, resourceType: 10);
+// 获取用户可访问的资源ID（带缓存）
+$ids = Collaborator::getUserResourceIds($userId, $resourceType);
 
-// 批量设置协作者
-Collaborator::setResourceCollaborators(resourceId: 100, resourceType: 10, userIds: [1, 2, 3]);
-
-// 从模型实例管理
-$script->addCollaborator(userId: 1);
-$script->removeCollaborator(userId: 1);
-$script->setCollaborators([1, 2, 3]);
-$script->getCollaboratorIds();
-```
-
-**资源类型常量（可自定义）：**
-
-```php
-Collaborator::RESOURCE_TYPE_CORP = 1;    // 企业
-Collaborator::RESOURCE_TYPE_AGENT = 2;   // 代理商
-Collaborator::RESOURCE_TYPE_SCRIPT = 10; // 话术
-Collaborator::RESOURCE_TYPE_LINE = 11;   // 线路
-Collaborator::RESOURCE_TYPE_TASK = 12;   // 任务
+// 批量设置
+Collaborator::setResourceCollaborators($resourceId, $resourceType, $userIds);
 ```
 
 ## 上下文管理
@@ -212,16 +171,13 @@ CorpContext::set(
 CorpContext::setCorpId(1);
 CorpContext::getCorpId();
 
-CorpContext::setEmployeeId(100);
-CorpContext::getEmployeeId();
-
 CorpContext::setAuthRange(3);
 CorpContext::getAuthRange();
 
 CorpContext::setIsAdmin(true);
 CorpContext::isAdmin();
 
-// 临时跳过数据范围过滤
+// 临时跳过数据范围
 CorpContext::withoutDataScope(function () {
     return Order::query()->get();
 });
@@ -238,7 +194,7 @@ return [
 ];
 ```
 
-## 权限检查
+## 权限系统
 
 ### 注解权限（切面自动校验）
 
@@ -257,17 +213,10 @@ class UserController
     #[Permission('user.delete,admin')]
     public function delete() {}
 }
-
-// 类级别注解
-#[Permission('user')]
-class UserController
-{
-    public function list() {}  // 需要 user 权限
-}
 ```
 
-- 启动时自动收集注解，运行时切面校验，**无需额外中间件**
-- 管理员自动跳过校验
+- 启动时收集注解，运行时切面校验，**无需额外中间件**
+- 管理员自动跳过
 - 权限不足抛出 `PermissionDeniedException`
 
 ### 手动检查
@@ -276,7 +225,6 @@ class UserController
 $employee->hasPermission('user:create');
 $employee->hasRole('admin');
 
-$permissionService = make(PermissionService::class);
 $permissionService->hasPermission($employeeId, 'user:create');
 $permissionService->setRolePermissions($roleId, [1, 2, 3]);
 ```
@@ -288,14 +236,11 @@ $permissionService->setRolePermissions($roleId, [1, 2, 3]);
 return [
     'models' => [
         'employee' => \App\Model\Employee::class,
-        'collaborator' => \App\Model\Collaborator::class,
     ],
 ];
 ```
 
 ```php
-namespace App\Model;
-
 use HPlus\Corp\Model\Employee as BaseEmployee;
 
 class Employee extends BaseEmployee
@@ -307,37 +252,21 @@ class Employee extends BaseEmployee
 }
 ```
 
-通过 `CorpManager` 获取模型类：
-
-```php
-use HPlus\Corp\CorpManager;
-
-$employeeClass = CorpManager::employeeModel();
-$collaboratorClass = CorpManager::collaboratorModel();
-```
-
 ## 多部门支持
 
 ```php
-// 设置主部门
 $employee->setPrimaryDepartment($deptId);
-
-// 添加到部门
 $employee->addToDepartment($deptId);
-
-// 从部门移除
 $employee->removeFromDepartment($deptId);
-
-// 获取所有部门ID
-$ids = $employee->getAllDepartmentIds();
-
-// 批量设置
-$employeeService->setDepartments($employeeId, [1, 2, 3], primaryDepartmentId: 1);
+$employee->getAllDepartmentIds();
 ```
 
-## 模型缓存
+## 性能优化
 
-所有模型支持 Hyperf 模型缓存：
+- **协作者缓存**：静态缓存 + Redis 缓存（5分钟）
+- **部门子树缓存**：上下文缓存 + 静态缓存
+- **字段检测缓存**：静态缓存（避免重复查库）
+- **模型缓存**：Hyperf 原生模型缓存
 
 ```php
 $corp = Corp::findFromCache($corpId);

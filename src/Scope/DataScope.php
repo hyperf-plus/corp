@@ -6,6 +6,7 @@ namespace HPlus\Corp\Scope;
 
 use HPlus\Corp\Context\CorpContext;
 use HPlus\Corp\CorpManager;
+use HPlus\Corp\Model\Collaborator;
 use HPlus\Corp\Model\Role;
 use Hyperf\Database\Model\Builder;
 use Hyperf\Database\Model\Model;
@@ -15,14 +16,24 @@ use Hyperf\DbConnection\Db;
 /**
  * 数据范围过滤作用域
  * 
- * 基于角色的 auth_range 自动过滤数据：
- * - 1: 仅本人（employee_id）
- * - 2: 本部门（department_id）
- * - 3: 本部门及下属（department_id + full_path）
- * - 4: 全部（不过滤）
+ * 用户级数据隔离，支持：
+ * 1. 角色数据范围（auth_range）：仅本人/本部门/本部门及下属/全部
+ * 2. 协作者权限（可选）：通过协作者表授权访问
+ * 
+ * 最终可见数据 = 角色数据范围内的数据 ∪ 被授权协作的数据
  */
 class DataScope implements Scope
 {
+    /**
+     * 字段检测缓存（静态，进程级）
+     */
+    private static array $columnCache = [];
+
+    /**
+     * 部门子树缓存（静态，进程级 - 短期有效）
+     */
+    private static array $deptTreeCache = [];
+
     public function apply(Builder $builder, Model $model): void
     {
         // 跳过过滤
@@ -38,112 +49,194 @@ class DataScope implements Scope
             return;
         }
 
-        // 管理员不过滤
+        $table = $model->getTable();
+
+        // 1. 先过滤 corp_id（企业隔离是基础）
+        if ($this->hasColumn($model, 'corp_id')) {
+            $builder->where("{$table}.corp_id", $corpId);
+        }
+
+        // 2. 管理员只过滤 corp_id，不过滤数据范围
         if (CorpContext::isAdmin()) {
-            // 只过滤 corp_id
-            if ($this->hasColumn($model, 'corp_id')) {
-                $builder->where($model->getTable() . '.corp_id', $corpId);
-            }
             return;
         }
 
-        $table = $model->getTable();
+        // 3. 获取模型配置
+        $enableCollaborator = $model->enableCollaborator ?? false;
+        $resourceType = $model->resourceType ?? 0;
+        $resourceIdColumn = $model->resourceIdColumn ?? $model->getKeyName();
 
-        // 先过滤 corp_id
-        if ($this->hasColumn($model, 'corp_id')) {
-            $builder->where($table . '.corp_id', $corpId);
-        }
-
-        // 再根据 auth_range 过滤
-        $authRange = CorpContext::getAuthRange();
-        
-        switch ($authRange) {
-            case Role::AUTH_RANGE_SELF:
-                // 仅本人
-                if ($this->hasColumn($model, 'employee_id')) {
-                    $builder->where($table . '.employee_id', $employeeId);
-                }
-                break;
-
-            case Role::AUTH_RANGE_DEPARTMENT:
-                // 本部门
-                $this->applyDepartmentScope($builder, $model, false);
-                break;
-
-            case Role::AUTH_RANGE_DEPARTMENT_SUB:
-                // 本部门及下属
-                $this->applyDepartmentScope($builder, $model, true);
-                break;
-
-            case Role::AUTH_RANGE_ALL:
-                // 全部，不额外过滤
-                break;
-
-            default:
-                // 默认仅本人
-                if ($this->hasColumn($model, 'employee_id')) {
-                    $builder->where($table . '.employee_id', $employeeId);
-                }
-        }
+        // 4. 构建用户可见范围
+        $this->applyUserScope($builder, $model, $enableCollaborator, $resourceType, $resourceIdColumn);
     }
 
     /**
-     * 应用部门范围过滤
+     * 应用用户数据范围
      */
-    protected function applyDepartmentScope(Builder $builder, Model $model, bool $includeSubDepts): void
-    {
+    protected function applyUserScope(
+        Builder $builder,
+        Model $model,
+        bool $enableCollaborator,
+        int $resourceType,
+        string $resourceIdColumn
+    ): void {
         $table = $model->getTable();
         $employeeId = CorpContext::getEmployeeId();
-        
-        // 获取可访问的部门ID
-        $deptIds = $this->getAccessibleDeptIds($includeSubDepts);
-        
-        if (empty($deptIds)) {
-            // 没有部门权限，只能看自己的
-            if ($this->hasColumn($model, 'employee_id')) {
-                $builder->where($table . '.employee_id', $employeeId);
-            }
+        $authRange = CorpContext::getAuthRange();
+
+        // 全部权限，且没有启用协作者，直接返回
+        if ($authRange === Role::AUTH_RANGE_ALL && !$enableCollaborator) {
             return;
         }
 
-        // 特殊标记 [-1] 表示全部
-        if ($deptIds === [-1]) {
-            return;
-        }
+        // 构建可见范围条件
+        $builder->where(function ($query) use (
+            $table, $model, $employeeId, $authRange,
+            $enableCollaborator, $resourceType, $resourceIdColumn
+        ) {
+            $hasCondition = false;
 
-        $builder->where(function ($query) use ($table, $deptIds, $employeeId, $model) {
-            // 自己的数据
-            if ($this->hasColumn($model, 'employee_id')) {
-                $query->where($table . '.employee_id', $employeeId);
-            }
-            
-            // 或者部门范围内的数据
-            if ($this->hasColumn($model, 'department_id')) {
-                $query->orWhereIn($table . '.department_id', $deptIds);
-            }
-            
-            // 支持多部门字段
-            if ($this->hasColumn($model, 'department_ids')) {
-                foreach ($deptIds as $deptId) {
-                    $query->orWhereJsonContains($table . '.department_ids', $deptId);
+            // A. 角色数据范围
+            if ($authRange !== Role::AUTH_RANGE_ALL) {
+                $this->applyAuthRangeCondition($query, $model, $authRange, $hasCondition);
+            } else {
+                // 全部权限，不添加角色范围条件（相当于 OR 1=1，但需要配合协作者）
+                // 如果有协作者，角色权限是"全部"，则所有数据都可见
+                if ($enableCollaborator) {
+                    return; // 不添加任何条件
                 }
+            }
+
+            // B. 协作者权限（OR 关系）
+            if ($enableCollaborator && $resourceType > 0) {
+                $collaboratorIds = Collaborator::getUserResourceIds($employeeId, $resourceType);
+                if (!empty($collaboratorIds)) {
+                    $column = "{$table}.{$resourceIdColumn}";
+                    if ($hasCondition) {
+                        $query->orWhereIn($column, $collaboratorIds);
+                    } else {
+                        $query->whereIn($column, $collaboratorIds);
+                        $hasCondition = true;
+                    }
+                }
+            }
+
+            // 如果没有任何条件且不是全部权限，返回空结果
+            if (!$hasCondition && $authRange !== Role::AUTH_RANGE_ALL) {
+                $query->whereRaw('1 = 0');
             }
         });
     }
 
     /**
-     * 获取可访问的部门ID列表
+     * 应用角色数据范围条件
+     */
+    protected function applyAuthRangeCondition(Builder $query, Model $model, int $authRange, bool &$hasCondition): void
+    {
+        $table = $model->getTable();
+        $employeeId = CorpContext::getEmployeeId();
+
+        switch ($authRange) {
+            case Role::AUTH_RANGE_SELF:
+                // 仅本人
+                if ($this->hasColumn($model, 'employee_id')) {
+                    $query->where("{$table}.employee_id", $employeeId);
+                    $hasCondition = true;
+                }
+                break;
+
+            case Role::AUTH_RANGE_DEPARTMENT:
+                // 本部门
+                $this->applyDepartmentCondition($query, $model, false, $hasCondition);
+                break;
+
+            case Role::AUTH_RANGE_DEPARTMENT_SUB:
+                // 本部门及下属
+                $this->applyDepartmentCondition($query, $model, true, $hasCondition);
+                break;
+        }
+    }
+
+    /**
+     * 应用部门范围条件
+     */
+    protected function applyDepartmentCondition(Builder $query, Model $model, bool $includeSubDepts, bool &$hasCondition): void
+    {
+        $table = $model->getTable();
+        $employeeId = CorpContext::getEmployeeId();
+        $deptIds = $this->getAccessibleDeptIds($includeSubDepts);
+
+        // 没有部门权限时，只能看自己的
+        if (empty($deptIds)) {
+            if ($this->hasColumn($model, 'employee_id')) {
+                $query->where("{$table}.employee_id", $employeeId);
+                $hasCondition = true;
+            }
+            return;
+        }
+
+        // 构建部门 + 自己的条件
+        $query->where(function ($subQuery) use ($table, $model, $employeeId, $deptIds) {
+            $added = false;
+
+            // 自己的数据
+            if ($this->hasColumn($model, 'employee_id')) {
+                $subQuery->where("{$table}.employee_id", $employeeId);
+                $added = true;
+            }
+
+            // 部门范围内的数据
+            if ($this->hasColumn($model, 'department_id')) {
+                if ($added) {
+                    $subQuery->orWhereIn("{$table}.department_id", $deptIds);
+                } else {
+                    $subQuery->whereIn("{$table}.department_id", $deptIds);
+                    $added = true;
+                }
+            }
+
+            // 多部门字段（JSON）
+            if ($this->hasColumn($model, 'department_ids') && !empty($deptIds)) {
+                $this->applyJsonDepartmentCondition($subQuery, $table, $deptIds, $added);
+            }
+        });
+
+        $hasCondition = true;
+    }
+
+    /**
+     * 应用 JSON 多部门字段条件
+     */
+    protected function applyJsonDepartmentCondition(Builder $query, string $table, array $deptIds, bool $useOr): void
+    {
+        // 优化：批量构建 JSON 条件，避免多次 orWhereJsonContains
+        $jsonConditions = [];
+        foreach ($deptIds as $deptId) {
+            $jsonConditions[] = "JSON_CONTAINS({$table}.department_ids, '{$deptId}')";
+        }
+
+        if (!empty($jsonConditions)) {
+            $rawCondition = '(' . implode(' OR ', $jsonConditions) . ')';
+            if ($useOr) {
+                $query->orWhereRaw($rawCondition);
+            } else {
+                $query->whereRaw($rawCondition);
+            }
+        }
+    }
+
+    /**
+     * 获取可访问的部门ID列表（带缓存）
      */
     protected function getAccessibleDeptIds(bool $includeSubDepts): array
     {
-        // 优先从上下文获取（已缓存）
+        // 1. 优先从上下文获取（请求级缓存）
         $cached = CorpContext::getAccessibleDeptIds();
         if (!empty($cached)) {
             return $cached;
         }
 
         $corpId = CorpContext::getCorpId();
-        $employeeId = CorpContext::getEmployeeId();
         $departmentId = CorpContext::getDepartmentId();
 
         if (!$departmentId) {
@@ -153,45 +246,66 @@ class DataScope implements Scope
         $deptIds = [$departmentId];
 
         if ($includeSubDepts) {
-            // 获取子部门
-            $deptModel = CorpManager::departmentModel();
-            $dept = $deptModel::find($departmentId);
-            
-            if ($dept && $dept->full_path) {
-                $subDeptIds = $deptModel::query()
-                    ->where('corp_id', $corpId)
-                    ->where('full_path', 'like', $dept->full_path . '%')
-                    ->pluck('department_id')
-                    ->toArray();
-                $deptIds = array_unique(array_merge($deptIds, $subDeptIds));
+            // 2. 静态缓存（进程级）
+            $cacheKey = "{$corpId}:{$departmentId}";
+            if (isset(self::$deptTreeCache[$cacheKey])) {
+                $deptIds = self::$deptTreeCache[$cacheKey];
+            } else {
+                $deptModel = CorpManager::departmentModel();
+                $dept = $deptModel::findFromCache($departmentId);
+
+                if ($dept && $dept->full_path) {
+                    // 使用物化路径高效查询子树
+                    $subDeptIds = $deptModel::query()
+                        ->where('corp_id', $corpId)
+                        ->where('full_path', 'like', $dept->full_path . '%')
+                        ->pluck('department_id')
+                        ->toArray();
+                    $deptIds = array_values(array_unique(array_merge($deptIds, $subDeptIds)));
+                }
+
+                // 缓存到静态变量（单进程内有效）
+                self::$deptTreeCache[$cacheKey] = $deptIds;
             }
         }
 
-        // 缓存到上下文
+        // 3. 缓存到上下文（单请求内有效）
         CorpContext::setAccessibleDeptIds($deptIds);
-        
+
         return $deptIds;
     }
 
     /**
-     * 检查模型是否有指定字段
+     * 检查模型是否有指定字段（带缓存）
      */
     protected function hasColumn(Model $model, string $column): bool
     {
-        static $cache = [];
         $table = $model->getTable();
-        $key = $table . ':' . $column;
-        
-        if (!isset($cache[$key])) {
-            try {
-                $columns = Db::getSchemaBuilder()->getColumnListing($table);
-                $cache[$key] = in_array($column, $columns);
-            } catch (\Throwable $e) {
-                $cache[$key] = false;
+        $key = "{$table}:{$column}";
+
+        if (!isset(self::$columnCache[$key])) {
+            // 优先从 fillable 检查（避免查库）
+            if (in_array($column, $model->getFillable())) {
+                self::$columnCache[$key] = true;
+            } else {
+                try {
+                    $columns = Db::getSchemaBuilder()->getColumnListing($table);
+                    self::$columnCache[$key] = in_array($column, $columns);
+                } catch (\Throwable $e) {
+                    self::$columnCache[$key] = false;
+                }
             }
         }
-        
-        return $cache[$key];
+
+        return self::$columnCache[$key];
+    }
+
+    /**
+     * 清除缓存（用于测试或手动刷新）
+     */
+    public static function clearCache(): void
+    {
+        self::$columnCache = [];
+        self::$deptTreeCache = [];
     }
 }
-
